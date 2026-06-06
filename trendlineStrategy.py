@@ -122,7 +122,10 @@ def support_resistance(df):
     window=50,
     errpct=0.003)
 
-    return minwindows[-1], maxwindows[-1]
+    minwindows = [item for sublist in minwindows for item in sublist]
+    maxwindows = [item for sublist in maxwindows for item in sublist]
+
+    return minwindows, maxwindows
 
 
 # ============================================================
@@ -244,12 +247,12 @@ def update_live_data(data, message, last_total_volume):
 
     # If the message is empty or broken, don't do anything
     if "symbol" not in message:
-        return data, last_total_volume
+        return data, last_total_volume, None
     
     ltp = message.get('ltp')                            # LTP = Last Traded Price (The current market price)
 
     if ltp is None:
-        return data, last_total_volume
+        return data, last_total_volume, None
     
     # Cumulative volume is the total shares traded since 9:15 AM. 
     # We want to find out how many were traded just in the last tick.
@@ -288,50 +291,100 @@ def update_live_data(data, message, last_total_volume):
         data.iloc[-1, 1] = max(data.iloc[-1, 1], ltp)   # Update High if price went higher
         data.iloc[-1, 2] = min(data.iloc[-1, 2], ltp)   # Update Low if price went lower
         data.iloc[-1, 4] += incremental_vol             # Add the new volume to the minute's total
+        return data, total_vol, None
     else:
         new_candle = pd.DataFrame(
             [{'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': incremental_vol}],
             index=[timestamp]
         )
 
-        # IMPORTANT:
-        #
-        # We calculate support/resistance ONLY when a candle closes.
-        #
-        # Why?
-        #
-        # During candle formation, price keeps moving rapidly.
-        # This can create fake highs/lows and unstable trendlines.
-        #
-        # Closed candles provide more reliable market structure.
-        # ✅ Step 1: Trim first, so index positions are stable
-        data = data.tail(max_candles).copy()
-
-        # ✅ Step 2: Drop stale trendline columns before recomputing
-        trendline_cols = [c for c in data.columns if c.startswith('support:') or c.startswith('resistance:')]
-        data = data.drop(columns=trendline_cols)
-
-        # ✅ Step 3: Compute S/R on clean, trimmed, completed candles
-        minwindows, maxwindows = support_resistance(df=data)
-        print(minwindows)
-
-        # ✅ Step 4: NOW append new candle (so trendline arrays are sized correctly)
+        # data = data.tail(max_candles).copy()
         data = pd.concat([data, new_candle])
 
-        support = generate_trendline_data(df=data, trend_data=minwindows, type='support')
-        resistance = generate_trendline_data(df=data, trend_data=maxwindows, type='resistance')
+        # Compute S/R on all closed candles (exclude last, which is forming)
+        closed = data.iloc[:-1]
+        minwindows, maxwindows = support_resistance(df=closed)
 
-        for points, upper, lower, is_active in support:
-            if is_active:
-                data[f'support: {points} upper'] = upper
-                data[f'support: {points} lower'] = lower
+        # Build compact zone list — just the boundary values at the LAST closed candle
+        # This is O(k) where k = number of trendlines, typically 4-8, not n=100
+        # Inside update_live_data, just before calling _build_zone_cache
+        print(f"\n{'='*55}")
+        print(f"[CANDLE CLOSE] {data.index[-2]}  |  "
+            f"O={closed.iloc[-1]['open']} H={closed.iloc[-1]['high']} "
+            f"L={closed.iloc[-1]['low']} C={closed.iloc[-1]['close']}")
+        print(f"{'='*55}")
+        zones = _build_zone_cache(closed, minwindows, maxwindows)
 
-        for points, upper, lower, is_active in resistance:
-            if is_active:
-                data[f'resistance: {points} upper'] = upper
-                data[f'resistance: {points} lower'] = lower
+        return data, total_vol, zones
 
-    return data, total_vol
+    # return data, total_vol
+
+
+def _build_zone_cache(df, minwindows, maxwindows):
+    """
+    Extract only the zone boundary values at the most recent candle.
+    Returns a flat list of dicts — O(k) to build, O(1) to query per tick.
+    """
+    zones = []
+    last_idx = len(df) - 1
+
+    for trend_data, zone_type in [(minwindows, 'support'), (maxwindows, 'resistance')]:
+        for points, result in trend_data:
+            if len(points) < 2:
+                continue
+
+            slope = result[0]
+            intercept = result[1]
+            ssr = result[2]
+            n = len(points)
+
+            if n < 3:       # need at least 3 points for n-2 denominator
+                continue
+
+            sd = math.sqrt(ssr / (n - 2)) if ssr > 0 else 0
+            # min_sd = intercept * 0.003
+            # sd = max(sd, min_sd)
+
+            # Check if zone is still active up to the last candle
+            is_active = True
+            for i in range(min(points), last_idx + 1):
+                val = slope * i + intercept
+                if df['low'].iloc[i] + 3 * sd < val and zone_type == 'support':
+                    is_active = False
+                    break
+                elif df['high'].iloc[i] - 3 * sd > val and zone_type == 'resistance':
+                    is_active = False
+                    break
+
+            val_at_last = slope * last_idx + intercept
+            upper = val_at_last + sd * 3
+            lower = val_at_last - sd * 3
+
+            # ── Debug print ──────────────────────────────────────
+            status = "ACTIVE  ✅" if is_active else "BROKEN  ❌"
+            print(f"  [{zone_type.upper():<10}] {status} | "
+                  f"zone={lower:.2f}-{upper:.2f} | "
+                  f"slope={slope:.4f} | points={points}")
+
+            if not is_active:
+                continue
+
+            # Only store the boundary values at the last candle index
+            # This is the single value we need for entry/exit checks
+            # val_at_last = slope * last_idx + intercept
+            zones.append({
+                'type': zone_type,
+                'upper': val_at_last + sd * 3,
+                'lower': val_at_last - sd * 3,
+                'slope': slope,
+                'intercept': intercept,
+                'sd': sd,
+                'start_idx': min(points),   # trendline starts here in the closed df
+                'df_length': last_idx + 1,  # how many candles were in closed df when computed
+                'points': points,
+            })
+
+    return zones
 
 
 # ============================================================
@@ -350,12 +403,8 @@ def plot_chart(candlestick):
         ax_vol.clear()
 
         data_to_plot = candlestick.data.tail(plot_window).copy()
+        plot_data = data_to_plot[['open', 'high', 'low', 'close', 'volume']]
 
-        ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
-        trendline_cols = [c for c in data_to_plot.columns if c not in ohlcv_cols]
-        plot_data = data_to_plot[ohlcv_cols]
-
-        # Plot candlesticks first (no addplot needed)
         mpf.plot(
             plot_data,
             type='candle',
@@ -365,35 +414,41 @@ def plot_chart(candlestick):
             ylabel='Price',
         )
 
-        # mplfinance uses integer x positions internally (0, 1, 2, ...)
-        # but only plots non-NaN candles, so we need to map our data indices
-        # to the actual rendered x positions
         n = len(plot_data)
-        x = np.arange(n)
 
-        # Draw shaded bands AFTER mpf.plot so they sit on top
-        for col in trendline_cols:
-            if not col.endswith(' upper'):
-                continue
-            base = col.replace(' upper', '')
-            lower_col = base + ' lower'
-            if lower_col not in data_to_plot.columns:
-                continue
+        # Total candles in self.data (used to map zone indices to plot positions)
+        # Zone indices were computed on data.iloc[:-1], so offset = total_len - 1
+        total_len = len(candlestick.data)
 
-            upper_vals = data_to_plot[col].values
-            lower_vals = data_to_plot[lower_col].values
+        for zone in candlestick.active_zones:
+            color = 'green' if zone['type'] == 'support' else 'red'
+            slope = zone['slope']
+            intercept = zone['intercept']
+            sd = zone['sd']
+            start_idx = zone['start_idx']   # absolute index in closed df
 
-            # We only shade areas where both upper and lower
-            # boundaries actually exist.
-            #
-            # NaN values mean the trendline is inactive
-            # or outside the valid region.
+            upper_vals = np.full(n, np.nan)
+            lower_vals = np.full(n, np.nan)
+
+            
+            for plot_pos in range(n):
+                # Map plot position back to absolute candle index in self.data
+                # plot_pos 0 = data_to_plot.index[0] = self.data[-n]
+                abs_idx = total_len - n + plot_pos  # -1 because last is forming
+
+                # Only draw from where the trendline starts
+                if abs_idx < start_idx:
+                    continue
+
+                val = slope * abs_idx + intercept
+                upper_vals[plot_pos] = val + sd * 3
+                lower_vals[plot_pos] = val - sd * 3
+
             valid = ~np.isnan(upper_vals) & ~np.isnan(lower_vals)
             if not valid.any():
                 continue
 
-            color = 'green' if col.startswith('support') else 'red'
-
+            x = np.arange(n)
             ax.fill_between(
                 x,
                 lower_vals,
@@ -401,7 +456,7 @@ def plot_chart(candlestick):
                 where=valid,
                 alpha=0.15,
                 color=color,
-                zorder=2,       # Draw above candles
+                zorder=2
             )
 
         ax.set_title(f'{symbol} Real-Time Candlestick Chart')
@@ -467,7 +522,7 @@ def log_trade(action, symbol, price):
         price (float): Execution price.
     """
     with open("trades_log.csv", "a") as file:
-        file.write(f"{dt.datetime.now(pytz.timezone(timeZone))},{action},{symbol},{price}\n")
+        file.write(f"{dt.datetime.now(pytz.timezone(timeZone))},{action},trendlines,{symbol},{price}\n")
 
 # ============================================================
 # Candlestick Class to Manage State and WebSocket Callbacks
@@ -500,6 +555,17 @@ class Candlestick:
         self.fyers = fyers
         self.trigger = None
         self.last_evaluated_candle = None
+        self.active_zones = []
+
+
+    # ============================================================
+    # Cleaner function
+    # ============================================================    
+    def _clear_position(self):
+        self.position = None
+        self.sl = None
+        self.tp = None
+        self.trigger = None
 
 
     # ============================================================
@@ -513,106 +579,153 @@ class Candlestick:
             message (dict): The received message from the WebSocket.
 
         """
-        self.data, self.last_total_volume = update_live_data(data=self.data, message=message, last_total_volume=self.last_total_volume)
+        self.data, self.last_total_volume, new_zones = update_live_data(data=self.data, message=message, last_total_volume=self.last_total_volume)
         print(self.data.tail())
 
+        # --- Guard Conditions ---
+        if new_zones is not None:
+            self.active_zones = new_zones
+
+        if len(self.data) < 2:
+            return
+        
+        ltp = message.get('ltp')
+        if ltp is None:
+            return
+
+        # --- Last Closed Candle ---
         closed_candle = self.data.iloc[-2]
         closed_candle_time = self.data.index[-2]
 
+        # Always get fresh zone data from last closed candle
+        # (zones are recomputed on every candle close, so this
+        #  extract all active support/resistance column names present)
+        # zone_cols = [c for c in self.data.columns
+        #             if (c.startswith('support:') or c.startswith('resistance:'))
+        #             and not pd.isna(closed_candle[c])]
 
         # --------------------------------------------------------
         # Buy/Sell LOGIC (Evaluates on the last closed candle)
         # --------------------------------------------------------
         if not self.position and closed_candle_time != self.last_evaluated_candle:
             self.last_evaluated_candle = closed_candle_time
-            # Extract all active support/resistance column names present for this candle
-            active_cols = [c for c in self.data.columns if not pd.isna(closed_candle[c])]
-            
-            for col in active_cols:
+
+            for zone in self.active_zones:
                 # --- LONG ENTRY (Price respects Support) ---
-                if col.startswith('support:') and col.endswith(' upper'):
-                    base = col.replace(' upper', '')
-                    lower_col = base + ' lower'
-                    
-                    if lower_col in active_cols:
-                        sup_upper = closed_candle[col]
-                        sup_lower = closed_candle[lower_col]
-                        
-                        # Correct floating-point range check instead of range()
-                        low_inside_zone = sup_lower <= closed_candle['low'] <= sup_upper
-                        closed_above_zone = closed_candle['close'] > sup_upper
-                        
-                        if low_inside_zone and closed_above_zone:
-                            print(f"\n[EXECUTION] 🔥 Price respected Support Zone ({sup_lower:.2f} - {sup_upper:.2f})!")
-                            print(f"Candle Low dipped into zone, and Close ({closed_candle['close']}) held above it. Going LONG.")
-                            ask = self.fyers.quotes(data={"symbols":symbol})['d'][0]['v']['ask']
-                            log_trade("Buy", symbol, ask)
-                            self.sl = sup_lower
-                            self.tp = ask + (ask - self.sl) * 2
-                            self.trigger = closed_candle['high']
-                            self.position = 'LONG'
-                            break  # Exit loop once a signal is taken
+                if zone['type'] == 'support':
+                    if zone['lower'] <= closed_candle['low'] <= zone['upper'] \
+                            and closed_candle['close'] > zone['upper']:
+                        ask = self.fyers.quotes(data={"symbols": symbol})['d'][0]['v']['ask']
+                        log_trade("Buy", symbol, ask)
+                        self.sl = zone['lower']
+                        self.tp = ask + (ask - self.sl) * 2
+                        self.trigger = closed_candle['high']
+                        self.position = 'LONG'
+                        print(f"[ENTRY LONG] Zone {zone['lower']:.2f}-{zone['upper']:.2f}, ask={ask}")
+                        break  # Exit loop once a signal is taken
 
                 # --- SHORT ENTRY (Price respects Resistance) ---
-                elif col.startswith('resistance:') and col.endswith(' upper'):
-                    base = col.replace(' upper', '')
-                    lower_col = base + ' lower'
-                    
-                    if lower_col in active_cols:
-                        res_upper = closed_candle[col]
-                        res_lower = closed_candle[lower_col]
-                        
-                        # Correct floating-point range check instead of range()
-                        high_inside_zone = res_lower <= closed_candle['high'] <= res_upper
-                        closed_below_zone = closed_candle['close'] < res_lower
-                        
-                        if high_inside_zone and closed_below_zone:
-                            print(f"\n[EXECUTION] 🔥 Price respected Resistance Zone ({res_lower:.2f} - {res_upper:.2f})!")
-                            print(f"Candle High poked into zone, and Close ({closed_candle['close']}) held below it. Going SHORT.")
-                            bid = self.fyers.quotes(data={"symbols":symbol})['d'][0]['v']['bid']
-                            log_trade("Sell", symbol, bid)
-                            self.sl = res_upper
-                            self.tp = bid - (self.sl - bid) * 2
-                            self.trigger = closed_candle['low']
-                            self.position = 'SHORT'
-                            break  # Exit loop once a signal is taken
+                elif zone['type'] == 'resistance':
+                    if zone['lower'] <= closed_candle['high'] <= zone['upper'] \
+                            and closed_candle['close'] < zone['lower']:
+                        bid = self.fyers.quotes(data={"symbols": symbol})['d'][0]['v']['bid']
+                        log_trade("Sell", symbol, bid)
+                        self.sl = zone['upper']
+                        self.tp = bid - (self.sl - bid) * 2
+                        self.trigger = closed_candle['low']
+                        self.position = 'SHORT'
+                        print(f"[ENTRY SHORT] Zone {zone['lower']:.2f}-{zone['upper']:.2f}, bid={bid}")
+                        break  # Exit loop once a signal is taken
 
 
         # --------------------------------------------------------
         # Exit LOGIC (Evaluates on the last closed candle)
         # --------------------------------------------------------
         if self.position == 'LONG':
-            ltp = message.get('ltp')
-            if ltp >= self.tp or ltp <= self.sl:
-                print(f"\n[EXIT] LONG position exited at LTP: {ltp}. TP was {self.tp}, SL was {self.sl}.")
-                bid = self.fyers.quotes(data={"symbols":symbol})['d'][0]['v']['bid']
+
+            # --- Condition 1: Hard TP/SL hit ---
+            if ltp >= self.tp or ltp < self.sl:
+                print(f"[EXIT LONG] Hard TP/SL hit at {ltp}")
+                bid = self.fyers.quotes(data={"symbols": symbol})['d'][0]['v']['bid']
                 log_trade("Sell", symbol, bid)
-                self.position = None
-                self.sl = None
-                self.tp = None
-            elif closed_candle['close'] > self.trigger:
-                new_sl = closed_candle['low']
-                if new_sl > self.sl:
-                    diff = new_sl - self.sl
-                    self.tp += diff                         # Adjust TP based on new risk
-                    self.sl = new_sl                        # Trailing stop loss to the low of the last closed candle
-                    self.trigger = closed_candle['high']    # Trailing trigger point
+                self._clear_position()
+
+            else:
+                # --- Condition 2: Price entering a resistance zone ---
+                # If ltp is inside any active resistance band, exit -
+                # resistance overhead is a structural reason to close long
+                for zone in self.active_zones:
+                    if zone['type'] == 'resistance' and zone['lower'] <= ltp <= zone['upper']:
+                        bid = self.fyers.quotes(data={"symbols": symbol})['d'][0]['v']['bid']
+                        log_trade("Sell", symbol, bid)
+                        print(f"[EXIT LONG] Entered resistance {zone['lower']:.2f}-{zone['upper']:.2f}")
+                        self._clear_position()
+                        break
+
+                # --- Condition 3: Price breaking down through support ---
+                # If ltp breaks BELOW a support zone that sits ABOVE sl,
+                # that support has failed - exit before hitting hard SL.
+                # Only check if still in position (condition 2 may have exited)
+                if self.position == 'LONG':
+                    for zone in self.active_zones:
+                        if zone['type'] == 'support' \
+                                and zone['lower'] > self.sl \
+                                and ltp < zone['lower']:
+                            bid = self.fyers.quotes(data={"symbols": symbol})['d'][0]['v']['bid']
+                            log_trade("Sell", symbol, bid)
+                            print(f"[EXIT LONG] Support broken {zone['lower']:.2f}")
+                            self._clear_position()
+                            break
+
+                # --- Trailing SL/TP (only if still in position) ---
+                if self.position == 'LONG' and closed_candle['close'] > self.trigger:
+                    new_sl = closed_candle['low']
+                    if new_sl > self.sl:
+                        diff = new_sl - self.sl
+                        self.tp += diff
+                        self.sl = new_sl
+                        self.trigger = closed_candle['high']
+
         elif self.position == 'SHORT':
-            ltp = message.get('ltp')
-            if ltp >= self.sl or ltp <= self.tp:
-                print(f"\n[EXIT] SHORT position exited at LTP: {ltp}. TP was {self.tp}, SL was {self.sl}.")
-                ask = self.fyers.quotes(data={"symbols":symbol})['d'][0]['v']['ask']
+
+            # --- Condition 1: Hard TP/SL hit ---
+            if ltp <= self.tp or ltp > self.sl:
+                print(f"[EXIT SHORT] Hard TP/SL hit at {ltp}")
+                ask = self.fyers.quotes(data={"symbols": symbol})['d'][0]['v']['ask']
                 log_trade("Buy", symbol, ask)
-                self.position = None
-                self.sl = None
-                self.tp = None
-            elif closed_candle['close'] < self.trigger:
-                new_sl = closed_candle['high']
-                if new_sl < self.sl:
-                    diff = self.sl - new_sl
-                    self.tp -= diff                     # Adjust TP based on new risk
-                    self.sl = new_sl                    # Trailing stop loss to the high of the last closed candle
-                    self.trigger = closed_candle['low'] # Trailing trigger point
+                self._clear_position()
+
+            else:
+                # --- Condition 2: Price entering a support zone ---
+                # Support below price is a structural reason to close short
+                for zone in self.active_zones:
+                    if zone['type'] == 'support' and zone['lower'] <= ltp <= zone['upper']:
+                        ask = self.fyers.quotes(data={"symbols": symbol})['d'][0]['v']['ask']
+                        log_trade("Buy", symbol, ask)
+                        print(f"[EXIT SHORT] Entered support {zone['lower']:.2f}-{zone['upper']:.2f}")
+                        self._clear_position()
+                        break
+
+                # --- Condition 3: Price breaking up through resistance ---
+                if self.position == 'SHORT':
+                    for zone in self.active_zones:
+                        if zone['type'] == 'resistance' \
+                                and zone['upper'] < self.sl \
+                                and ltp > zone['upper']:
+                            ask = self.fyers.quotes(data={"symbols": symbol})['d'][0]['v']['ask']
+                            log_trade("Buy", symbol, ask)
+                            print(f"[EXIT SHORT] Resistance broken {zone['upper']:.2f}")
+                            self._clear_position()
+                            break
+
+                # --- Trailing SL/TP ---
+                if self.position == 'SHORT' and closed_candle['close'] < self.trigger:
+                    new_sl = closed_candle['high']
+                    if new_sl < self.sl:
+                        diff = self.sl - new_sl
+                        self.tp -= diff
+                        self.sl = new_sl
+                        self.trigger = closed_candle['low']
 
 
     # ============================================================
@@ -678,7 +791,7 @@ if __name__ == "__main__":
            ↓
     Validate Active Trendlines
            ↓
-    Draw Real-Time Zones
+    Execute Entry/Exit
     
     ============================================================
     '''
@@ -721,3 +834,8 @@ if __name__ == "__main__":
         plot_chart(candlestick)
     finally:
         fyersSocket.close_connection()
+
+# df = [
+#     2026-06-01 13:52:02.004667+05:30,Buy,NSE:RELIANCE-EQ,1321
+# 2026-06-01 13:52:06.475871+05:30,Sell,NSE:RELIANCE-EQ,1321.6
+# ]
